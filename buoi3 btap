@@ -1,0 +1,549 @@
+
+# ============================================================
+# BÀI 2: XÂY DỰNG MÔ HÌNH PHÂN LOẠI WINE QUALITY
+# Google Colab - Toàn bộ chương trình trong 1 cell
+# ============================================================
+
+!pip -q install imbalanced-learn
+
+import io
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from google.colab import files
+from IPython.display import display
+
+from sklearn.model_selection import (
+    train_test_split, StratifiedKFold, cross_validate
+)
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, classification_report,
+    ConfusionMatrixDisplay, PrecisionRecallDisplay,
+    roc_auc_score, average_precision_score
+)
+from imblearn.over_sampling import RandomOverSampler, SMOTE
+from imblearn.under_sampling import RandomUnderSampler
+from imblearn.pipeline import Pipeline as ImbPipeline
+
+warnings.filterwarnings("ignore")
+RANDOM_STATE = 42
+sns.set_theme(style="whitegrid")
+
+# ============================================================
+# 1. TẢI VÀ ĐỌC DỮ LIỆU
+# ============================================================
+
+print("===== 1. TẢI DỮ LIỆU =====")
+print("Hãy chọn file wine_quality_merged.csv")
+
+uploaded = files.upload()
+
+if not uploaded:
+    raise ValueError("Bạn chưa tải file dữ liệu lên!")
+
+filename = next(iter(uploaded))
+raw = uploaded[filename]
+
+# Tự nhận diện dấu phân cách CSV
+df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python")
+
+print("\nTên file:", filename)
+print("Kích thước dữ liệu:", df.shape)
+print("\n5 dòng đầu tiên:")
+display(df.head())
+
+print("\nDanh sách các cột:")
+print(df.columns.tolist())
+
+# ============================================================
+# 2. KHÁM PHÁ DỮ LIỆU - EDA
+# ============================================================
+
+print("\n===== 2. KHÁM PHÁ DỮ LIỆU =====")
+
+print("\nSố giá trị thiếu:")
+print(df.isnull().sum())
+
+print("\nSố dòng trùng lặp:")
+print(df.duplicated().sum())
+
+print("\nKiểu dữ liệu:")
+print(df.dtypes)
+
+print("\nThống kê mô tả:")
+display(df.describe(include="all").T)
+
+# Loại bỏ dòng trùng lặp
+df = df.drop_duplicates().copy()
+
+# Tìm cột quality
+target_candidates = [
+    c for c in df.columns
+    if c.strip().lower() == "quality"
+]
+
+if not target_candidates:
+    raise ValueError(
+        "Không tìm thấy cột 'quality'. "
+        "Hãy kiểm tra lại tên cột trong file CSV."
+    )
+
+target_col = target_candidates[0]
+
+# ============================================================
+# 3. XÂY DỰNG NHÃN PHÂN LOẠI
+# ============================================================
+
+print("\n===== 3. PHÂN LOẠI CHẤT LƯỢNG RƯỢU =====")
+
+# Quy ước bài toán phân loại nhị phân:
+# 0: Chất lượng thấp hoặc trung bình (quality < 6)
+# 1: Chất lượng tốt (quality >= 6)
+# Đây là quy ước thực hành, không phải nhãn mặc định
+# được xác nhận từ file dữ liệu.
+
+quality = pd.to_numeric(df[target_col], errors="coerce")
+valid = quality.notna()
+df = df.loc[valid].copy()
+quality = quality.loc[valid]
+
+df["target"] = (quality >= 6).astype(int)
+
+print("\nPhân bố các mức quality ban đầu:")
+print(quality.value_counts().sort_index())
+
+class_count = df["target"].value_counts().sort_index()
+
+class_distribution = pd.DataFrame({
+    "Số mẫu": class_count,
+    "Tỷ lệ (%)": (
+        class_count / class_count.sum() * 100
+    ).round(2)
+})
+
+class_distribution.index = [
+    "Chất lượng thấp/trung bình (0)",
+    "Chất lượng tốt (1)"
+]
+
+print("\nBảng phân bố lớp:")
+display(class_distribution)
+
+plt.figure(figsize=(7, 4))
+sns.countplot(data=df, x="target")
+plt.title("Phân bố hai lớp chất lượng rượu")
+plt.xlabel("Nhãn phân loại")
+plt.ylabel("Số lượng mẫu")
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 4. PHÂN TÍCH ĐẶC TRƯNG
+# ============================================================
+
+print("\n===== 4. PHÂN TÍCH ĐẶC TRƯNG =====")
+
+# Không dùng quality làm đầu vào vì target được tạo từ quality
+X = df.drop(columns=[target_col, "target"])
+y = df["target"]
+
+# Chuyển các cột phân loại thành biến giả
+X = pd.get_dummies(X, drop_first=False, dtype=float)
+
+# Xử lý giá trị vô hạn
+X = X.replace([np.inf, -np.inf], np.nan)
+
+# Loại cột hoàn toàn thiếu dữ liệu
+X = X.dropna(axis=1, how="all")
+
+if X.shape[1] == 0:
+    raise ValueError("Không còn đặc trưng hợp lệ để huấn luyện.")
+
+feature_scale = pd.DataFrame({
+    "Mean": X.mean(),
+    "Std": X.std(),
+    "Min": X.min(),
+    "Max": X.max()
+}).sort_values("Std", ascending=False)
+
+print("\nThống kê thang đo đặc trưng:")
+display(feature_scale.head(15))
+
+plt.figure(figsize=(10, 6))
+sns.heatmap(
+    X.corr(),
+    cmap="coolwarm",
+    center=0
+)
+plt.title("Ma trận tương quan các đặc trưng")
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 5. CHIA TRAIN / TEST
+# ============================================================
+
+print("\n===== 5. CHIA DỮ LIỆU TRAIN / TEST =====")
+
+if y.nunique() != 2:
+    raise ValueError(
+        "Dữ liệu sau khi tạo nhãn không có đủ hai lớp."
+    )
+
+if y.value_counts().min() < 5:
+    raise ValueError(
+        "Lớp ít mẫu nhất có dưới 5 mẫu, "
+        "không đủ để chạy Stratified 5-Fold."
+    )
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=0.2,
+    random_state=RANDOM_STATE,
+    stratify=y
+)
+
+print("X_train:", X_train.shape)
+print("X_test :", X_test.shape)
+print("y_train:", y_train.shape)
+print("y_test :", y_test.shape)
+
+# ============================================================
+# 6. XÂY DỰNG CÁC MÔ HÌNH
+# ============================================================
+
+print("\n===== 6. XÂY DỰNG MÔ HÌNH =====")
+
+def make_model(sampler=None, scale=True):
+    steps = [
+        ("imputer", SimpleImputer(strategy="median"))
+    ]
+
+    if scale:
+        steps.append(("scaler", StandardScaler()))
+
+    if sampler is not None:
+        steps.append(("sampler", sampler))
+
+    steps.append((
+        "model",
+        LogisticRegression(
+            max_iter=5000,
+            random_state=RANDOM_STATE
+        )
+    ))
+
+    return ImbPipeline(steps)
+
+models = {
+    "Logistic No Scale": make_model(scale=False),
+
+    "Logistic StandardScaler": make_model(),
+
+    "Random Oversampling": make_model(
+        RandomOverSampler(random_state=RANDOM_STATE)
+    ),
+
+    "Random Undersampling": make_model(
+        RandomUnderSampler(random_state=RANDOM_STATE)
+    ),
+
+    "SMOTE": make_model(
+        SMOTE(
+            random_state=RANDOM_STATE,
+            k_neighbors=3
+        )
+    )
+}
+
+# ============================================================
+# 7. CROSS VALIDATION
+# ============================================================
+
+print("\n===== 7. CROSS VALIDATION =====")
+
+cv = StratifiedKFold(
+    n_splits=5,
+    shuffle=True,
+    random_state=RANDOM_STATE
+)
+
+scoring = {
+    "accuracy": "accuracy",
+    "precision": "precision",
+    "recall": "recall",
+    "f1": "f1",
+    "roc_auc": "roc_auc",
+    "pr_auc": "average_precision"
+}
+
+results = []
+
+for name, model in models.items():
+    print("Đang đánh giá:", name)
+
+    scores = cross_validate(
+        model,
+        X_train,
+        y_train,
+        cv=cv,
+        scoring=scoring,
+        n_jobs=-1,
+        error_score="raise"
+    )
+
+    row = {"Mô hình": name}
+
+    for metric in scoring:
+        row[metric] = scores[
+            "test_" + metric
+        ].mean()
+
+    results.append(row)
+
+comparison = pd.DataFrame(results)
+
+comparison = comparison.sort_values(
+    by="f1",
+    ascending=False
+).reset_index(drop=True)
+
+print("\nBẢNG SO SÁNH CROSS VALIDATION:")
+display(comparison.round(4))
+
+# ============================================================
+# 8. BIỂU ĐỒ SO SÁNH MÔ HÌNH
+# ============================================================
+
+print("\n===== 8. BIỂU ĐỒ SO SÁNH =====")
+
+comparison_plot = comparison.set_index("Mô hình")
+
+comparison_plot[
+    ["accuracy", "precision", "recall", "f1"]
+].plot(
+    kind="bar",
+    figsize=(12, 6),
+    rot=25
+)
+
+plt.title("So sánh các mô hình phân loại")
+plt.ylabel("Giá trị chỉ số")
+plt.ylim(0, 1.05)
+plt.legend(title="Chỉ số")
+plt.tight_layout()
+plt.show()
+
+comparison_plot[
+    ["accuracy", "precision", "recall", "f1"]
+].plot(
+    kind="line",
+    marker="o",
+    figsize=(12, 5)
+)
+
+plt.title("Biểu đồ đường so sánh các mô hình")
+plt.ylabel("Giá trị chỉ số")
+plt.ylim(0, 1.05)
+plt.xticks(rotation=25)
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 9. CHỌN MÔ HÌNH TỐT NHẤT
+# ============================================================
+
+print("\n===== 9. CHỌN MÔ HÌNH TỐT NHẤT =====")
+
+best_name = comparison.iloc[0]["Mô hình"]
+best_model = models[best_name]
+
+print("Mô hình được chọn:", best_name)
+
+# Chỉ huấn luyện trên training set
+best_model.fit(X_train, y_train)
+
+# Dự đoán trên test set
+y_pred = best_model.predict(X_test)
+y_prob = best_model.predict_proba(X_test)[:, 1]
+
+# ============================================================
+# 10. ĐÁNH GIÁ TRÊN TEST SET
+# ============================================================
+
+print("\n===== 10. ĐÁNH GIÁ TEST SET =====")
+
+test_results = pd.DataFrame({
+    "Chỉ số": [
+        "Accuracy",
+        "Precision",
+        "Recall",
+        "F1-score",
+        "ROC-AUC",
+        "PR-AUC"
+    ],
+    "Giá trị": [
+        accuracy_score(y_test, y_pred),
+        precision_score(y_test, y_pred, zero_division=0),
+        recall_score(y_test, y_pred, zero_division=0),
+        f1_score(y_test, y_pred, zero_division=0),
+        roc_auc_score(y_test, y_prob),
+        average_precision_score(y_test, y_prob)
+    ]
+})
+
+display(test_results.round(4))
+
+print("\nCLASSIFICATION REPORT:")
+print(classification_report(
+    y_test,
+    y_pred,
+    target_names=[
+        "Thấp/trung bình (0)",
+        "Tốt (1)"
+    ],
+    digits=4,
+    zero_division=0
+))
+
+# ============================================================
+# 11. CONFUSION MATRIX
+# ============================================================
+
+print("\n===== 11. CONFUSION MATRIX =====")
+
+ConfusionMatrixDisplay.from_predictions(
+    y_test,
+    y_pred,
+    display_labels=["Thấp/TB", "Tốt"],
+    cmap="Blues",
+    values_format="d"
+)
+
+plt.title("Confusion Matrix - " + best_name)
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 12. PRECISION-RECALL CURVE
+# ============================================================
+
+print("\n===== 12. PRECISION-RECALL CURVE =====")
+
+PrecisionRecallDisplay.from_predictions(
+    y_test,
+    y_prob,
+    name=best_name
+)
+
+plt.title("Precision-Recall Curve")
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 13. ROC CURVE
+# ============================================================
+
+print("\n===== 13. ROC CURVE =====")
+
+from sklearn.metrics import RocCurveDisplay
+
+RocCurveDisplay.from_predictions(
+    y_test,
+    y_prob,
+    name=best_name
+)
+
+plt.plot([0, 1], [0, 1], "--")
+plt.title("ROC Curve")
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 14. SO SÁNH NHÃN THỰC TẾ VÀ DỰ ĐOÁN
+# ============================================================
+
+print("\n===== 14. KẾT QUẢ DỰ ĐOÁN =====")
+
+prediction_table = pd.DataFrame({
+    "Thực tế": y_test.to_numpy(),
+    "Dự đoán": y_pred,
+    "Xác suất lớp tốt": y_prob
+})
+
+prediction_table["Kết quả"] = np.where(
+    prediction_table["Thực tế"] ==
+    prediction_table["Dự đoán"],
+    "Đúng",
+    "Sai"
+)
+
+display(prediction_table.head(20))
+
+# ============================================================
+# 15. XUẤT KẾT QUẢ RA EXCEL
+# ============================================================
+
+print("\n===== 15. XUẤT FILE EXCEL =====")
+
+output_file = "Ket_qua_phan_loai_Wine_Quality.xlsx"
+
+with pd.ExcelWriter(output_file) as writer:
+    class_distribution.to_excel(
+        writer, sheet_name="Phan_bo_lop"
+    )
+
+    feature_scale.to_excel(
+        writer, sheet_name="Thong_ke_dac_trung"
+    )
+
+    comparison.to_excel(
+        writer,
+        sheet_name="So_sanh_mo_hinh",
+        index=False
+    )
+
+    test_results.to_excel(
+        writer,
+        sheet_name="Danh_gia_Test",
+        index=False
+    )
+
+    prediction_table.to_excel(
+        writer,
+        sheet_name="Ket_qua_du_doan",
+        index=False
+    )
+
+files.download(output_file)
+
+# ============================================================
+# 16. KẾT LUẬN
+# ============================================================
+
+print("\n" + "=" * 55)
+print("KẾT LUẬN BÀI 2")
+print("=" * 55)
+
+print("Tổng số mẫu:", len(df))
+print("Số đặc trưng:", X.shape[1])
+print("Số mẫu huấn luyện:", len(X_train))
+print("Số mẫu kiểm tra:", len(X_test))
+
+print("\nMô hình tốt nhất theo F1-score Cross Validation:")
+print(best_name)
+
+print("\nKết quả trên tập Test:")
+for _, row in test_results.iterrows():
+    print(f"{row['Chỉ số']}: {row['Giá trị']:.4f}")
+
+print("\nĐã hoàn thành huấn luyện và đánh giá mô hình!")
