@@ -1,0 +1,137 @@
+import os, time, random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from IPython.display import display
+from sklearn.metrics import confusion_matrix, classification_report, ConfusionMatrixDisplay
+SEED=42
+random.seed(SEED); np.random.seed(SEED); tf.keras.utils.set_random_seed(SEED)
+print('TensorFlow:',tf.__version__,'GPU:',tf.config.list_physical_devices('GPU'))
+(X_full,y_full),(X_test_raw,y_test)=tf.keras.datasets.fashion_mnist.load_data()
+X_train=X_full[:-10000].astype('float32')/255
+X_val=X_full[-10000:].astype('float32')/255
+X_test=X_test_raw.astype('float32')/255
+y_train=y_full[:-10000];y_val=y_full[-10000:]
+class_names=['T-shirt/top','Trouser','Pullover','Dress','Coat','Sandal','Shirt','Sneaker','Bag','Ankle boot']
+print('Train/Val/Test:',X_train.shape,X_val.shape,X_test.shape)
+
+EPOCHS=15  # Có thể tăng lên 25 nếu muốn quan sát đường học dài hơn
+results=[]; histories={}; trained_models={}
+def build_model(hidden=(256,128), lr=1e-3, dropout=0., l2=0.):
+    reg=tf.keras.regularizers.l2(l2) if l2 else None
+    layers=[tf.keras.layers.Input(shape=(28,28)),tf.keras.layers.Flatten()]
+    for units in hidden:
+        layers.append(tf.keras.layers.Dense(units,activation='relu',kernel_regularizer=reg))
+        if dropout: layers.append(tf.keras.layers.Dropout(dropout))
+    layers.append(tf.keras.layers.Dense(10,activation='softmax'))
+    m=tf.keras.Sequential(layers)
+    m.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=lr),loss='sparse_categorical_crossentropy',metrics=['accuracy'])
+    return m
+
+def run_experiment(name, hidden=(256,128),lr=1e-3,batch=64,dropout=0.,l2=0.):
+    tf.keras.backend.clear_session()
+    tf.keras.utils.set_random_seed(SEED)
+    m=build_model(hidden,lr,dropout,l2)
+    cb=[tf.keras.callbacks.EarlyStopping(monitor='val_loss',patience=3,restore_best_weights=True)]
+    start=time.perf_counter()
+    h=m.fit(X_train,y_train,validation_data=(X_val,y_val),epochs=EPOCHS,batch_size=batch,callbacks=cb,verbose=0)
+    seconds=time.perf_counter()-start
+    loss,acc=m.evaluate(X_test,y_test,verbose=0)
+    best=int(np.argmin(h.history['val_loss']))
+    row={'Thử nghiệm':name,'Hidden layers':str(hidden),'Parameters':m.count_params(),
+         'Learning rate':lr,'Batch size':batch,'Dropout':dropout,'L2':l2,
+         'Epoch tốt nhất':best+1,'Epoch đã chạy':len(h.history['loss']),
+         'Train accuracy':h.history['accuracy'][best],
+         'Validation accuracy':h.history['val_accuracy'][best],
+         'Test accuracy':acc,'Test loss':loss,'Thời gian (s)':round(seconds,1)}
+    results.append(row);histories[name]=h.history;trained_models[name]=m
+    print(name,'| Test accuracy:',round(acc,4),'| Thời gian:',round(seconds,1),'s')
+    return m
+
+def show_table(names):
+    display(pd.DataFrame([r for r in results if r['Thử nghiệm'] in names]).round(4))
+def plot_curves(names):
+    for metric in ['loss','accuracy']:
+        fig,ax=plt.subplots(1,2,figsize=(13,4))
+        for name in names:
+            h=histories[name]
+            ax[0].plot(range(1,len(h[metric])+1),h[metric],label=name)
+            ax[1].plot(range(1,len(h['val_'+metric])+1),h['val_'+metric],label=name)
+        ax[0].set_title('Training '+metric);ax[1].set_title('Validation '+metric)
+        for a in ax:a.set_xlabel('Epoch');a.grid(alpha=.3);a.legend(fontsize=8)
+        plt.tight_layout();plt.show()
+
+def best_of(names):
+    return max((r for r in results if r['Thử nghiệm'] in names),key=lambda r:r['Validation accuracy'])['Thử nghiệm']
+
+run_experiment('1 layer',**{'hidden': (256,)})
+run_experiment('2 layers (gốc)',**{'hidden': (256, 128)})
+run_experiment('3 layers',**{'hidden': (256, 128, 64)})
+show_table(['1 layer', '2 layers (gốc)', '3 layers'])
+plot_curves(['1 layer', '2 layers (gốc)', '3 layers'])
+
+run_experiment('LR 1e-2',**{'lr': 0.01})
+run_experiment('LR 1e-3',**{'lr': 0.001})
+run_experiment('LR 1e-4',**{'lr': 0.0001})
+show_table(['LR 1e-2', 'LR 1e-3', 'LR 1e-4'])
+plot_curves(['LR 1e-2', 'LR 1e-3', 'LR 1e-4'])
+
+run_experiment('Batch 32',**{'batch': 32})
+run_experiment('Batch 128',**{'batch': 128})
+run_experiment('Batch 512',**{'batch': 512})
+show_table(['Batch 32', 'Batch 128', 'Batch 512'])
+plot_curves(['Batch 32', 'Batch 128', 'Batch 512'])
+
+run_experiment('Không Dropout',**{})
+run_experiment('Dropout 0.3',**{'dropout': 0.3})
+show_table(['Không Dropout', 'Dropout 0.3'])
+plot_curves(['Không Dropout', 'Dropout 0.3'])
+
+run_experiment('Không L2',**{})
+run_experiment('L2 0.001',**{'l2': 0.001})
+show_table(['Không L2', 'L2 0.001'])
+plot_curves(['Không L2', 'L2 0.001'])
+
+model=trained_models['2 layers (gốc)']
+y_prob=model.predict(X_test,verbose=0)
+y_pred=np.argmax(y_prob,axis=1)
+wrong=np.flatnonzero(y_pred!=y_test)
+ranked=wrong[np.argsort(y_prob[wrong,y_pred[wrong]])[::-1]]
+top20=ranked[:20]
+error_df=pd.DataFrame({'Index':top20,'Nhãn thật':[class_names[i] for i in y_test[top20]],
+                       'Dự đoán':[class_names[i] for i in y_pred[top20]],
+                       'Confidence':y_prob[top20,y_pred[top20]]})
+display(error_df.round(4))
+fig,axes=plt.subplots(4,5,figsize=(15,12))
+for ax,i in zip(axes.flat,top20):
+    ax.imshow(X_test[i],cmap='gray');ax.axis('off')
+    ax.set_title(f'True: {class_names[y_test[i]]}\nPred: {class_names[y_pred[i]]}\nConf: {y_prob[i,y_pred[i]]:.2f}',fontsize=9)
+plt.tight_layout();plt.show()
+print('Nhận xét: những lớp có hình dạng gần giống nhau có thể bị nhầm; confidence cao không đảm bảo dự đoán đúng.')
+
+summary=pd.DataFrame(results).sort_values('Validation accuracy',ascending=False)
+display(summary.round(4))
+summary.to_csv('ket_qua_6_bai_MLP.csv',index=False,encoding='utf-8-sig')
+print('1. Kiến trúc gốc: Flatten(28×28) → Dense(256, ReLU) → Dense(128, ReLU) → Dense(10, Softmax).')
+print('2. Optimizer: Adam; loss: sparse_categorical_crossentropy; LR=0.001; batch=64 (mô hình gốc).')
+base=next(r for r in results if r['Thử nghiệm']=='2 layers (gốc)')
+print('3. Epoch tốt nhất:',base['Epoch tốt nhất'])
+print('4. Learning curves của các mô hình đã hiển thị ở từng bài.')
+print('5. Test accuracy mô hình gốc:',round(base['Test accuracy'],4))
+cm=confusion_matrix(y_test,y_pred)
+cm_no_diag=cm.copy();np.fill_diagonal(cm_no_diag,0)
+confusions=sorted([(cm_no_diag[i,j],class_names[i],class_names[j]) for i in range(10) for j in range(10) if i!=j],reverse=True)
+print('6. Hai hướng nhầm nhiều nhất (nhãn thật → nhãn dự đoán):')
+for count,a,b in confusions[:2]:print('  ',a,'→',b,':',count,'ảnh')
+base_h=histories['2 layers (gốc)']
+train_acc=base_h['accuracy'][-1];val_acc=base_h['val_accuracy'][-1]
+print('7. Chênh lệch train - validation accuracy epoch cuối:',round(train_acc-val_acc,4))
+print('   Nhận xét:', 'Có dấu hiệu overfitting nếu khoảng cách này lớn và validation loss tăng.' if train_acc-val_acc>.05 else 'Khoảng cách accuracy chưa lớn; xem thêm đồ thị loss để kết luận.')
+modified=[r for r in results if r['Thử nghiệm']=='Dropout 0.3'][0]
+control=[r for r in results if r['Thử nghiệm']=='Không Dropout'][0]
+print('8. Thay đổi thử nghiệm: Dropout 0.3; chênh lệch test accuracy so với không Dropout:',round(modified['Test accuracy']-control['Test accuracy'],4))
+fig,ax=plt.subplots(figsize=(10,7))
+ConfusionMatrixDisplay(confusion_matrix=cm,display_labels=class_names).plot(ax=ax,xticks_rotation=45,cmap='Blues',colorbar=False)
+plt.tight_layout();plt.show()
+print(classification_report(y_test,y_pred,target_names=class_names,digits=4))
