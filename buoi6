@@ -1,0 +1,752 @@
+
+# ============================================================
+# BAI 6 - TRANSFER LEARNING
+# FGVC-AIRCRAFT + EFFICIENTNET-B0
+# GOOGLE COLAB - MOT CELL DUY NHAT
+# ============================================================
+
+import os
+import copy
+import time
+import random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+
+from pathlib import Path
+from torchvision import datasets, models, transforms
+from torchvision.models import EfficientNet_B0_Weights
+from torch.utils.data import DataLoader
+from sklearn.metrics import (
+    f1_score,
+    confusion_matrix,
+    classification_report
+)
+from IPython.display import display
+
+# ================== 1. CAU HINH ==================
+
+SEED = 42
+BATCH_SIZE = 32
+IMAGE_SIZE = 224
+NUM_CLASSES = 100
+
+EPOCHS_SCRATCH = 5
+EPOCHS_PROBE = 10
+EPOCHS_PARTIAL = 5
+EPOCHS_FULL = 5
+
+PATIENCE = 4
+
+DATA_DIR = Path("/content/data")
+OUTPUT_DIR = Path("/content/aircraft_results")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+if not torch.cuda.is_available():
+    raise RuntimeError(
+        "Hay bat GPU: Runtime > Change runtime type > T4 GPU"
+    )
+
+DEVICE = torch.device("cuda:0")
+WEIGHTS = EfficientNet_B0_Weights.IMAGENET1K_V1
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+set_seed(SEED)
+
+print("Device:", DEVICE)
+print("PyTorch:", torch.__version__)
+
+# ================== 2. TIEN XU LY ==================
+
+MEAN = (0.485, 0.456, 0.406)
+STD = (0.229, 0.224, 0.225)
+
+train_transform = transforms.Compose([
+    transforms.RandomResizedCrop(
+        IMAGE_SIZE, scale=(0.72, 1.0)
+    ),
+    transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(
+        brightness=0.12,
+        contrast=0.12,
+        saturation=0.12
+    ),
+    transforms.ToTensor(),
+    transforms.Normalize(MEAN, STD)
+])
+
+eval_transform = WEIGHTS.transforms()
+
+# ================== 3. TAI DATASET ==================
+
+print("\nDang tai FGVC-Aircraft...")
+
+train_dataset = datasets.FGVCAircraft(
+    root=DATA_DIR,
+    split="train",
+    annotation_level="variant",
+    transform=train_transform,
+    download=True
+)
+
+train_clean = datasets.FGVCAircraft(
+    root=DATA_DIR,
+    split="train",
+    annotation_level="variant",
+    transform=eval_transform,
+    download=False
+)
+
+val_dataset = datasets.FGVCAircraft(
+    root=DATA_DIR,
+    split="val",
+    annotation_level="variant",
+    transform=eval_transform,
+    download=False
+)
+
+test_dataset = datasets.FGVCAircraft(
+    root=DATA_DIR,
+    split="test",
+    annotation_level="variant",
+    transform=eval_transform,
+    download=False
+)
+
+def make_loader(ds, shuffle=False):
+    return DataLoader(
+        ds,
+        batch_size=BATCH_SIZE,
+        shuffle=shuffle,
+        num_workers=2,
+        pin_memory=True
+    )
+
+train_loader = make_loader(train_dataset, True)
+train_clean_loader = make_loader(train_clean)
+val_loader = make_loader(val_dataset)
+test_loader = make_loader(test_dataset)
+
+print("\nTHONG TIN DU LIEU")
+print("Train:", len(train_dataset))
+print("Validation:", len(val_dataset))
+print("Test:", len(test_dataset))
+print("So lop:", NUM_CLASSES)
+
+# ================== 4. HIEN THI ANH ==================
+
+fig, axes = plt.subplots(2, 5, figsize=(14, 6))
+
+for ax, idx in zip(
+    axes.flat,
+    np.linspace(
+        0, len(train_clean)-1, 10, dtype=int
+    )
+):
+    img, label = train_clean[int(idx)]
+
+    img = img.permute(1, 2, 0).numpy()
+    img = img * np.array(STD) + np.array(MEAN)
+
+    ax.imshow(np.clip(img, 0, 1))
+    ax.set_title(f"Class {label}")
+    ax.axis("off")
+
+plt.suptitle("FGVC-Aircraft Dataset")
+plt.tight_layout()
+plt.show()
+
+# ================== 5. XAY DUNG MODEL ==================
+
+def build_model(pretrained=True):
+
+    model = models.efficientnet_b0(
+        weights=WEIGHTS if pretrained else None
+    )
+
+    in_features = model.classifier[1].in_features
+
+    model.classifier[1] = nn.Linear(
+        in_features, NUM_CLASSES
+    )
+
+    return model
+
+
+def configure_model(model, strategy):
+
+    for p in model.parameters():
+        p.requires_grad = False
+
+    if strategy in ["scratch", "full"]:
+        for p in model.parameters():
+            p.requires_grad = True
+
+    elif strategy == "probe":
+        for p in model.classifier.parameters():
+            p.requires_grad = True
+
+    elif strategy == "partial":
+        for p in model.features[-2:].parameters():
+            p.requires_grad = True
+
+        for p in model.classifier.parameters():
+            p.requires_grad = True
+
+    return model
+
+
+def count_parameters(model):
+
+    total = sum(
+        p.numel() for p in model.parameters()
+    )
+
+    trainable = sum(
+        p.numel() for p in model.parameters()
+        if p.requires_grad
+    )
+
+    return {
+        "Total": total,
+        "Trainable": trainable,
+        "Frozen": total-trainable
+    }
+
+# ================== 6. HAM DANH GIA ==================
+
+criterion = nn.CrossEntropyLoss()
+
+def evaluate(model, loader):
+
+    model.eval()
+
+    total_loss = 0
+    total = 0
+    correct = 0
+    top5_correct = 0
+
+    predictions = []
+    targets = []
+
+    with torch.inference_mode():
+
+        for images, labels in loader:
+
+            images = images.to(DEVICE)
+            labels = labels.to(DEVICE)
+
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+            batch_size = labels.size(0)
+
+            total_loss += loss.item() * batch_size
+            total += batch_size
+
+            preds = outputs.argmax(dim=1)
+
+            correct += (
+                preds == labels
+            ).sum().item()
+
+            top5 = outputs.topk(
+                5, dim=1
+            ).indices
+
+            top5_correct += (
+                top5 == labels.unsqueeze(1)
+            ).any(dim=1).sum().item()
+
+            predictions.extend(
+                preds.cpu().numpy()
+            )
+
+            targets.extend(
+                labels.cpu().numpy()
+            )
+
+    accuracy = correct / total
+
+    macro_f1 = f1_score(
+        targets,
+        predictions,
+        average="macro",
+        labels=list(range(NUM_CLASSES)),
+        zero_division=0
+    )
+
+    return {
+        "loss": total_loss / total,
+        "accuracy": accuracy,
+        "macro_f1": macro_f1,
+        "top5": top5_correct / total,
+        "preds": np.array(predictions),
+        "targets": np.array(targets)
+    }
+
+# ================== 7. HUAN LUYEN ==================
+
+def train_one_epoch(model, loader, optimizer, strategy):
+
+    model.train()
+
+    # Khong cap nhat running statistics cua
+    # BatchNorm trong backbone dong bang
+    if strategy in ["probe", "partial"]:
+        for module in model.modules():
+            if isinstance(module, nn.BatchNorm2d):
+                module.eval()
+
+    total_loss = 0
+    total = 0
+
+    for images, labels in loader:
+
+        images = images.to(DEVICE)
+        labels = labels.to(DEVICE)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item() * labels.size(0)
+        total += labels.size(0)
+
+    return total_loss / total
+
+
+def fit_model(name, strategy, epochs):
+
+    print("\n====================================")
+    print("DANG HUAN LUYEN:", name)
+    print("====================================")
+
+    set_seed(SEED)
+
+    model = build_model(
+        pretrained=(strategy != "scratch")
+    )
+
+    model = configure_model(
+        model, strategy
+    ).to(DEVICE)
+
+    print(count_parameters(model))
+
+    if strategy == "scratch":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=1e-3,
+            weight_decay=1e-4
+        )
+
+    elif strategy == "probe":
+        optimizer = torch.optim.AdamW(
+            model.classifier.parameters(),
+            lr=1e-3
+        )
+
+    elif strategy == "partial":
+        optimizer = torch.optim.AdamW([
+            {
+                "params": model.features[-2:].parameters(),
+                "lr": 1e-4
+            },
+            {
+                "params": model.classifier.parameters(),
+                "lr": 1e-3
+            }
+        ])
+
+    else:
+        optimizer = torch.optim.AdamW([
+            {
+                "params": model.features.parameters(),
+                "lr": 1e-5
+            },
+            {
+                "params": model.classifier.parameters(),
+                "lr": 1e-4
+            }
+        ])
+
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "val_acc": [],
+        "val_f1": [],
+        "val_top5": []
+    }
+
+    best_loss = float("inf")
+    best_state = None
+    best_epoch = 0
+    patience_count = 0
+
+    for epoch in range(epochs):
+
+        start = time.time()
+
+        train_loss = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            strategy
+        )
+
+        metrics = evaluate(model, val_loader)
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(metrics["loss"])
+        history["val_acc"].append(metrics["accuracy"])
+        history["val_f1"].append(metrics["macro_f1"])
+        history["val_top5"].append(metrics["top5"])
+
+        print(
+            f"Epoch {epoch+1}/{epochs} | "
+            f"Train Loss: {train_loss:.4f} | "
+            f"Val Loss: {metrics['loss']:.4f} | "
+            f"Accuracy: {metrics['accuracy']*100:.2f}% | "
+            f"F1: {metrics['macro_f1']:.4f} | "
+            f"Top5: {metrics['top5']*100:.2f}% | "
+            f"Time: {time.time()-start:.1f}s"
+        )
+
+        if metrics["loss"] < best_loss:
+
+            best_loss = metrics["loss"]
+            best_epoch = epoch + 1
+
+            best_state = {
+                k: v.detach().cpu().clone()
+                for k, v in model.state_dict().items()
+            }
+
+            patience_count = 0
+
+        else:
+            patience_count += 1
+
+        if patience_count >= PATIENCE:
+            print("Early stopping")
+            break
+
+    model.load_state_dict(best_state)
+
+    final_metrics = evaluate(model, val_loader)
+
+    summary = {
+        "Model": name,
+        "Best epoch": best_epoch,
+        "Val loss": final_metrics["loss"],
+        "Val accuracy": final_metrics["accuracy"],
+        "Val macro-F1": final_metrics["macro_f1"],
+        "Val top-5": final_metrics["top5"]
+    }
+
+    return model, history, summary
+
+# ================== 8. CHAY 4 THI NGHIEM ==================
+
+histories = {}
+summaries = {}
+best_states = {}
+
+experiments = [
+    ("Scratch", "scratch", EPOCHS_SCRATCH),
+    ("Linear Probe", "probe", EPOCHS_PROBE),
+    ("Partial FT", "partial", EPOCHS_PARTIAL),
+    ("Full FT", "full", EPOCHS_FULL)
+]
+
+for name, strategy, epochs in experiments:
+
+    model, history, summary = fit_model(
+        name, strategy, epochs
+    )
+
+    histories[name] = history
+    summaries[name] = summary
+
+    best_states[name] = {
+        k: v.detach().cpu().clone()
+        for k, v in model.state_dict().items()
+    }
+
+    del model
+    torch.cuda.empty_cache()
+
+# ================== 9. BANG SO SANH ==================
+
+comparison = pd.DataFrame(
+    list(summaries.values())
+)
+
+comparison = comparison.sort_values(
+    "Val loss"
+).reset_index(drop=True)
+
+print("\nBANG SO SANH CAC MO HINH")
+display(comparison.round(4))
+
+comparison.to_csv(
+    OUTPUT_DIR / "comparison.csv",
+    index=False
+)
+
+# ================== 10. BIEU DO ==================
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+for name, history in histories.items():
+
+    epochs = range(
+        1, len(history["train_loss"])+1
+    )
+
+    axes[0].plot(
+        epochs,
+        history["val_loss"],
+        marker="o",
+        label=name
+    )
+
+    axes[1].plot(
+        epochs,
+        np.array(history["val_acc"])*100,
+        marker="o",
+        label=name
+    )
+
+    axes[2].plot(
+        epochs,
+        history["val_f1"],
+        marker="o",
+        label=name
+    )
+
+axes[0].set_title("Validation Loss")
+axes[1].set_title("Validation Accuracy")
+axes[2].set_title("Validation Macro-F1")
+
+for ax in axes:
+    ax.set_xlabel("Epoch")
+    ax.grid(True)
+    ax.legend()
+
+axes[0].set_ylabel("Loss")
+axes[1].set_ylabel("Accuracy (%)")
+axes[2].set_ylabel("Macro-F1")
+
+plt.tight_layout()
+plt.savefig(
+    OUTPUT_DIR / "learning_curves.png",
+    dpi=200
+)
+plt.show()
+
+# ================== 11. CHON MODEL TOT NHAT ==================
+
+selected_name = comparison.iloc[0]["Model"]
+
+print("\nMODEL DUOC CHON:", selected_name)
+
+best_model = build_model(
+    pretrained=False
+).to(DEVICE)
+
+best_model.load_state_dict(
+    best_states[selected_name]
+)
+
+best_model.eval()
+
+# ================== 12. TEST DOC LAP ==================
+
+test_metrics = evaluate(
+    best_model, test_loader
+)
+
+test_report = pd.DataFrame([{
+    "Selected model": selected_name,
+    "Test loss": test_metrics["loss"],
+    "Test accuracy": test_metrics["accuracy"],
+    "Test macro-F1": test_metrics["macro_f1"],
+    "Test top-5": test_metrics["top5"],
+    "N test": len(test_dataset)
+}])
+
+print("\nKET QUA TREN TAP TEST")
+display(test_report.round(4))
+
+test_report.to_csv(
+    OUTPUT_DIR / "test_results.csv",
+    index=False
+)
+
+# ================== 13. MA TRAN NHAM LAN ==================
+
+cm = confusion_matrix(
+    test_metrics["targets"],
+    test_metrics["preds"],
+    labels=np.arange(NUM_CLASSES)
+)
+
+plt.figure(figsize=(12, 10))
+plt.imshow(cm, cmap="Blues")
+plt.colorbar()
+
+plt.title(
+    f"Confusion Matrix - {selected_name}"
+)
+
+plt.xlabel("Predicted Label")
+plt.ylabel("True Label")
+
+plt.tight_layout()
+plt.savefig(
+    OUTPUT_DIR / "confusion_matrix.png",
+    dpi=200
+)
+plt.show()
+
+# ================== 14. BAO CAO TUNG LOP ==================
+
+report = classification_report(
+    test_metrics["targets"],
+    test_metrics["preds"],
+    labels=np.arange(NUM_CLASSES),
+    output_dict=True,
+    zero_division=0
+)
+
+report_df = pd.DataFrame(report).T
+
+print("\n10 LOP CO F1 THAP NHAT")
+
+class_report = report_df.iloc[:NUM_CLASSES]
+
+display(
+    class_report.sort_values(
+        "f1-score"
+    ).head(10).round(4)
+)
+
+report_df.to_csv(
+    OUTPUT_DIR / "classification_report.csv"
+)
+
+# ================== 15. HIEN THI ANH DU DOAN SAI ==================
+
+mistakes = np.where(
+    test_metrics["targets"] !=
+    test_metrics["preds"]
+)[0]
+
+print("\nSo anh du doan sai:", len(mistakes))
+
+if len(mistakes) > 0:
+
+    fig, axes = plt.subplots(
+        2, 4, figsize=(14, 7)
+    )
+
+    for ax, idx in zip(
+        axes.flat, mistakes[:8]
+    ):
+
+        img, label = test_dataset[int(idx)]
+
+        arr = img.permute(1, 2, 0).numpy()
+        arr = arr * np.array(STD) + np.array(MEAN)
+
+        ax.imshow(np.clip(arr, 0, 1))
+
+        ax.set_title(
+            f"True: {label} | "
+            f"Pred: {test_metrics['preds'][idx]}"
+        )
+
+        ax.axis("off")
+
+    plt.tight_layout()
+    plt.savefig(
+        OUTPUT_DIR / "wrong_predictions.png",
+        dpi=200
+    )
+    plt.show()
+
+# ================== 16. LUU MODEL ==================
+
+checkpoint_path = (
+    OUTPUT_DIR / "best_efficientnet_b0.pt"
+)
+
+torch.save({
+    "architecture": "efficientnet_b0",
+    "num_classes": NUM_CLASSES,
+    "selected_strategy": selected_name,
+    "state_dict": {
+        k: v.detach().cpu()
+        for k, v in best_model.state_dict().items()
+    },
+    "image_size": IMAGE_SIZE,
+    "mean": MEAN,
+    "std": STD
+}, checkpoint_path)
+
+print("\nDA LUU MODEL:", checkpoint_path)
+
+# ================== 17. KET LUAN ==================
+
+print("\n========== TONG KET ==========")
+
+print("Dataset: FGVC-Aircraft")
+print("Backbone: EfficientNet-B0")
+print("Pretrained: ImageNet-1K")
+print("So lop:", NUM_CLASSES)
+
+print("Model tot nhat:", selected_name)
+
+print(
+    "Test Accuracy:",
+    f"{test_metrics['accuracy']*100:.2f}%"
+)
+
+print(
+    "Test Macro-F1:",
+    f"{test_metrics['macro_f1']:.4f}"
+)
+
+print(
+    "Test Top-5:",
+    f"{test_metrics['top5']*100:.2f}%"
+)
+
+print("Ket qua luu tai:", OUTPUT_DIR)
+
+# ================== 18. TAI KET QUA ==================
+
+import shutil
+from google.colab import files
+
+zip_path = shutil.make_archive(
+    "/content/aircraft_results",
+    "zip",
+    OUTPUT_DIR
+)
+
+print("\nDa tao file ZIP ket qua.")
+files.download(zip_path)
