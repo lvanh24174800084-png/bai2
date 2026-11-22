@@ -1,0 +1,692 @@
+import os, time, random, copy
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import torch
+from torch import nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import datasets, transforms
+from sklearn.datasets import load_digits
+from sklearn.metrics import ConfusionMatrixDisplay, classification_report, confusion_matrix
+
+SEED = 42
+DATA_SOURCE = "cifar10"  # bài tập CIFAR-10
+EPOCHS = 8
+BATCH_SIZE = 64
+LR = 1e-3
+
+def seed_all(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+
+seed_all()
+torch.set_num_threads(min(2, os.cpu_count() or 2))  # Ổn định thời gian trên CPU phổ thông
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"PyTorch {torch.__version__} | Device = {DEVICE} | Seed = {SEED}")
+print(f"DATA_SOURCE = {DATA_SOURCE} | EPOCHS = {EPOCHS}")
+
+CLASS_NAMES = ["airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "horse", "ship", "truck"]
+
+# Số ảnh mỗi lớp: 500 train + 100 validation. Đổi số lượng nếu muốn.
+N_TRAIN_PER_CLASS = 500
+N_VAL_PER_CLASS = 100
+
+def sample_by_class(y, n_train, n_val, seed=42):
+    rng = np.random.default_rng(seed)
+    tr, va = [], []
+    for label in np.unique(y):
+        ids = np.where(y == label)[0]
+        rng.shuffle(ids)
+        tr.extend(ids[:n_train])
+        va.extend(ids[n_train:n_train+n_val])
+    return np.array(tr), np.array(va)
+
+train_raw = datasets.CIFAR10(root="./data", train=True, download=True)
+test_raw = datasets.CIFAR10(root="./data", train=False, download=True)
+train_labels = np.asarray(train_raw.targets)
+it, iv = sample_by_class(train_labels, N_TRAIN_PER_CLASS, N_VAL_PER_CLASS, SEED)
+
+# CIFAR-10: numpy (N,32,32,3) -> PyTorch (N,3,32,32), pixel [0,1]
+def to_tensor_rgb(images):
+    return torch.from_numpy(np.asarray(images).copy()).permute(0,3,1,2).float().div(255.0)
+
+X_train = to_tensor_rgb(train_raw.data[it])
+X_val   = to_tensor_rgb(train_raw.data[iv])
+X_test  = to_tensor_rgb(test_raw.data)
+y_train = torch.tensor(train_labels[it], dtype=torch.long)
+y_val   = torch.tensor(train_labels[iv], dtype=torch.long)
+y_test  = torch.tensor(test_raw.targets, dtype=torch.long)
+
+# Chuẩn hóa theo từng kênh RGB, tính CHỈ từ train
+mu = X_train.mean(dim=(0,2,3)).view(3,1,1)
+sigma = X_train.std(dim=(0,2,3)).clamp_min(1e-6).view(3,1,1)
+print(f"Train / Validation / Test: {len(y_train)} / {len(y_val)} / {len(y_test)}")
+print("Kích thước tensor:", tuple(X_train.shape))
+print("Mean RGB:", mu.flatten().tolist())
+print("Std RGB:", sigma.flatten().tolist())
+print("Số ảnh mỗi lớp train:", torch.bincount(y_train).tolist())
+
+
+fig, axes = plt.subplots(2, 5, figsize=(12, 5))
+for c, ax in enumerate(axes.flat):
+    idx = int((y_train == c).nonzero(as_tuple=True)[0][0])
+    ax.imshow(X_train[idx].permute(1, 2, 0))
+    ax.set_title(CLASS_NAMES[c]); ax.axis("off")
+plt.suptitle("10 lớp ảnh CIFAR-10 — ảnh train")
+plt.tight_layout(); plt.show()
+
+
+class ImageTensorDataset(Dataset):
+    def __init__(self, x, y, augment=False):
+        self.x, self.y = x, y
+        self.augment = augment
+        self.augmenter = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.12, contrast=0.12),
+        ])
+    def __len__(self): return len(self.y)
+    def __getitem__(self, idx):
+        image = self.x[idx]
+        if self.augment: image = self.augmenter(image).clamp(0, 1)
+        image = (image - mu) / sigma
+        return image, self.y[idx]
+
+def loader(x, y, train=False, augment=False, batch_size=BATCH_SIZE):
+    return DataLoader(ImageTensorDataset(x, y, augment=augment),
+                      batch_size=batch_size, shuffle=train, num_workers=0)
+
+train_clean_loader = loader(X_train, y_train, train=False)
+train_plain_loader = loader(X_train, y_train, train=True)
+train_aug_loader   = loader(X_train, y_train, train=True, augment=True)
+val_loader        = loader(X_val, y_val)
+test_loader       = loader(X_test, y_test, batch_size=128)
+
+seed_all()
+fig, axs = plt.subplots(2, 6, figsize=(12, 4.6))
+for row, idx in enumerate([0, 1]):
+    original = X_train[idx]
+    axs[row,0].imshow(original.permute(1,2,0))
+    axs[row,0].set_title('Ảnh gốc')
+    for col in range(1,6):
+        a = train_aug_loader.dataset.augmenter(original).clamp(0,1)
+        axs[row,col].imshow(a.permute(1,2,0))
+        axs[row,col].set_title(f'Aug {col}')
+    for ax in axs[row]: ax.axis('off')
+plt.suptitle('Một nhãn, nhiều quan sát huấn luyện')
+plt.tight_layout(); plt.show()
+xb, yb = next(iter(train_plain_loader))
+print('Một mini-batch:', tuple(xb.shape), '| nhãn:', tuple(yb.shape))
+
+class LeNet(nn.Module):
+    def __init__(self, activation="tanh", pool="avg", batchnorm=False, dropout=0.0, n_classes=10):
+        super().__init__()
+        make_act = nn.Tanh if activation == "tanh" else nn.ReLU
+        make_pool = nn.AvgPool2d if pool == "avg" else nn.MaxPool2d
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 6, kernel_size=5),
+            nn.BatchNorm2d(6) if batchnorm else nn.Identity(),
+            make_act(), make_pool(2),
+            nn.Conv2d(6, 16, kernel_size=5),
+            nn.BatchNorm2d(16) if batchnorm else nn.Identity(),
+            make_act(), make_pool(2),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(), nn.Linear(16 * 5 * 5, 120), make_act(), nn.Dropout(dropout),
+            nn.Linear(120, 84), make_act(), nn.Dropout(dropout), nn.Linear(84, n_classes)
+        )
+    def forward(self, x):
+        return self.classifier(self.features(x))  # trả logits, KHÔNG softmax trước CrossEntropyLoss
+
+def count_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+baseline = LeNet()
+with torch.no_grad():
+    out = baseline(torch.zeros(4, 3, 32, 32))
+print('LeNet output:', tuple(out.shape), '| tham số:', f'{count_params(baseline):,}')
+print('LeNet classifier:', baseline.classifier)
+
+def vgg_block(cin, cout, nconv=2):
+    layers = []
+    for j in range(nconv):
+        layers += [nn.Conv2d(cin if j == 0 else cout, cout, 3, padding=1, bias=False),
+                   nn.BatchNorm2d(cout), nn.ReLU()]
+    return nn.Sequential(*layers, nn.MaxPool2d(2))
+
+class VGGTiny(nn.Module):
+    def __init__(self, n_classes=10):
+        super().__init__()
+        self.features = nn.Sequential(vgg_block(3,16), vgg_block(16,32), vgg_block(32,64))
+        self.head = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(),
+                                  nn.Linear(64,64), nn.ReLU(), nn.Dropout(.25),
+                                  nn.Linear(64,n_classes))
+    def forward(self,x): return self.head(self.features(x))
+
+class InceptionBlock(nn.Module):
+    def __init__(self, cin, branch_channels):
+        super().__init__()
+        c = branch_channels
+        # BatchNorm sau từng convolution để các nhánh có thang kích hoạt ổn định.
+        def cbr(a, b, k, p=0):
+            return [nn.Conv2d(a,b,k,padding=p,bias=False),nn.BatchNorm2d(b),nn.ReLU()]
+        self.b1 = nn.Sequential(*cbr(cin,c,1))
+        self.b3 = nn.Sequential(*cbr(cin,c,1),*cbr(c,c,3,p=1))
+        self.b5 = nn.Sequential(*cbr(cin,c,1),*cbr(c,c,5,p=2))
+        self.bp = nn.Sequential(nn.MaxPool2d(3,stride=1,padding=1),*cbr(cin,c,1))
+    def forward(self,x):
+        return torch.cat([self.b1(x),self.b3(x),self.b5(x),self.bp(x)],dim=1)
+
+class InceptionTiny(nn.Module):
+    def __init__(self,n_classes=10):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3,16,3,padding=1),nn.BatchNorm2d(16),nn.ReLU(),
+            InceptionBlock(16,8),nn.MaxPool2d(2),
+            InceptionBlock(32,16),nn.MaxPool2d(2),
+            InceptionBlock(64,16))
+        self.head = nn.Sequential(nn.AdaptiveAvgPool2d(1),nn.Flatten(),nn.Dropout(.25),nn.Linear(64,n_classes))
+    def forward(self,x):return self.head(self.features(x))
+
+class ResidualBlock(nn.Module):
+    def __init__(self,cin,cout,stride=1):
+        super().__init__()
+        self.residual = nn.Sequential(
+            nn.Conv2d(cin,cout,3,stride=stride,padding=1,bias=False),nn.BatchNorm2d(cout),nn.ReLU(),
+            nn.Conv2d(cout,cout,3,padding=1,bias=False),nn.BatchNorm2d(cout))
+        self.skip = (nn.Identity() if cin==cout and stride==1 else
+                     nn.Sequential(nn.Conv2d(cin,cout,1,stride=stride,bias=False),nn.BatchNorm2d(cout)))
+        self.act = nn.ReLU()
+    def forward(self,x): return self.act(self.residual(x)+self.skip(x))
+
+class ResNetTiny(nn.Module):
+    def __init__(self,n_classes=10):
+        super().__init__()
+        self.stem = nn.Sequential(nn.Conv2d(3,16,3,padding=1,bias=False),nn.BatchNorm2d(16),nn.ReLU())
+        self.blocks = nn.Sequential(ResidualBlock(16,16),ResidualBlock(16,32,stride=2),
+                                    ResidualBlock(32,32),ResidualBlock(32,64,stride=2),ResidualBlock(64,64))
+        self.head = nn.Sequential(nn.AdaptiveAvgPool2d(1),nn.Flatten(),nn.Linear(64,n_classes))
+    def forward(self,x): return self.head(self.blocks(self.stem(x)))
+
+models_for_shape = {"LeNet":LeNet(),"VGG-tiny":VGGTiny(),
+                    "Inception-tiny":InceptionTiny(),"ResNet-tiny":ResNetTiny()}
+shape_rows = []
+for name, net in models_for_shape.items():
+    with torch.no_grad(): output = net.eval()(torch.zeros(2,3,32,32))
+    shape_rows.append(dict(model=name, logits_shape=str(tuple(output.shape)),
+                           params=count_params(net)))
+pd.DataFrame(shape_rows)
+
+def train_one_epoch(model, dataloader, optimizer, criterion, device):
+    """Huấn luyện đúng 1 epoch; tái dùng cho MLP/CNN/RNN phân loại.
+
+    Args:
+        model: nn.Module, đầu ra là logits [batch, n_classes].
+        dataloader: iterable cung cấp (images/features, labels).
+        optimizer: torch.optim.Optimizer.
+        criterion: hàm loss (ví dụ nn.CrossEntropyLoss()).
+        device: torch.device("cpu"/"cuda").
+    Returns:
+        dict(loss, accuracy, n_samples); loss/accuracy trung bình theo SỐ MẪU.
+    """
+    model.train()                      # bật Dropout và train-mode của BatchNorm
+    total_loss = 0.0
+    n_correct = 0
+    n_samples = 0
+
+    for x, y in dataloader:
+        x = x.to(device)
+        y = y.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(x)              # forward
+        loss = criterion(logits, y)
+        loss.backward()                # backward: tính gradient
+        optimizer.step()               # cập nhật tham số
+
+        batch_size = y.size(0)
+        total_loss += loss.item() * batch_size
+        n_correct += (logits.argmax(dim=1) == y).sum().item()
+        n_samples += batch_size
+
+    if n_samples == 0:
+        raise ValueError("Train DataLoader không được rỗng")
+    return {"loss": total_loss / n_samples,
+            "accuracy": n_correct / n_samples,
+            "n_samples": n_samples}
+
+print("Đã khai báo train_one_epoch(model, dataloader, optimizer, criterion, device)")
+
+@torch.inference_mode()
+def evaluate(model, dataloader, criterion, device, return_predictions=False):
+    """Đánh giá không cập nhật trọng số; có thể trả nhãn để phục vụ test.
+
+    Dùng cho: monitor train sạch, validation, và lõi tính toán của test_model.
+    Không lựa chọn mô hình bằng kết quả test.
+    """
+    model.eval()                       # tắt Dropout; BatchNorm dùng running stats
+    total_loss = 0.0
+    n_correct = 0
+    n_samples = 0
+    y_true, y_pred = [], []
+
+    for x, y in dataloader:
+        x = x.to(device)
+        y = y.to(device)
+        logits = model(x)
+        loss = criterion(logits, y)
+        preds = logits.argmax(dim=1)
+
+        batch_size = y.size(0)
+        total_loss += loss.item() * batch_size
+        n_correct += (preds == y).sum().item()
+        n_samples += batch_size
+        if return_predictions:
+            y_true.extend(y.cpu().tolist())
+            y_pred.extend(preds.cpu().tolist())
+
+    if n_samples == 0:
+        raise ValueError("Eval DataLoader không được rỗng")
+    metrics = {"loss": total_loss / n_samples,
+               "accuracy": n_correct / n_samples,
+               "n_samples": n_samples}
+    if return_predictions:
+        metrics["y_true"] = np.asarray(y_true, dtype=np.int64)
+        metrics["y_pred"] = np.asarray(y_pred, dtype=np.int64)
+    return metrics
+
+print("Đã khai báo evaluate(model, dataloader, criterion, device, return_predictions=False)")
+
+def test_model(model, dataloader, criterion, device, class_names):
+    """Đánh giá CUỐI trên test set; không huấn luyện/điều chỉnh hyperparameter.
+
+    Tái sử dụng evaluate() để có cùng công thức loss/accuracy với validation.
+    Trả về dict gồm loss, accuracy, confusion matrix, report, nhãn thật/dự đoán.
+    """
+    raw = evaluate(model, dataloader, criterion, device, return_predictions=True)
+    labels = list(range(len(class_names)))
+    cm = confusion_matrix(raw["y_true"], raw["y_pred"], labels=labels)
+    report = classification_report(raw["y_true"], raw["y_pred"],
+                                   labels=labels, target_names=class_names,
+                                   zero_division=0)
+    return {"loss": raw["loss"], "accuracy": raw["accuracy"],
+            "n_samples": raw["n_samples"],
+            "y_true": raw["y_true"], "y_pred": raw["y_pred"],
+            "confusion_matrix": cm, "classification_report": report}
+
+print("Đã khai báo test_model(model, dataloader, criterion, device, class_names)")
+
+criterion = nn.CrossEntropyLoss()
+RESULTS, HISTORIES, BEST_MODELS = [], {}, {}
+VAL_ANALYSES = {}  # chỉ chứa mẫu và xác suất trên validation, KHÔNG chứa test
+
+
+def fit_model(model, train_loader, train_monitor_loader, val_loader,
+              optimizer, criterion, device, epochs, run_name):
+    """Vòng lặp epochs dùng chung: train, eval, checkpoint theo val loss.
+
+    In TẤT CẢ epoch và trả (model_best, history_dataframe, best_epoch).
+    """
+    history = []
+    best_val_loss, best_state, best_epoch = float("inf"), None, 0
+    print("epoch | opt_loss | train_loss | train_acc | val_loss | val_acc | best")
+    print("-" * 78)
+
+    for epoch in range(1, epochs + 1):
+        opt = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        train = evaluate(model, train_monitor_loader, criterion, device)
+        val = evaluate(model, val_loader, criterion, device)
+        history.append({"epoch": epoch, "opt_loss": opt["loss"],
+                        "opt_acc": opt["accuracy"],
+                        "train_loss": train["loss"], "train_acc": train["accuracy"],
+                        "val_loss": val["loss"], "val_acc": val["accuracy"]})
+
+        improved = val["loss"] < best_val_loss
+        if improved:
+            best_val_loss = val["loss"]
+            best_state = copy.deepcopy(model.state_dict())
+            best_epoch = epoch
+        print(f"{epoch:02d}/{epochs:02d} | {opt['loss']:.4f}   | "
+              f"{train['loss']:.4f}     | {train['accuracy']:.2%}  | "
+              f"{val['loss']:.4f}   | {val['accuracy']:.2%}  | {'*' if improved else ''}",
+              flush=True)
+
+    model.load_state_dict(best_state)
+    return model, pd.DataFrame(history), best_epoch
+
+
+def plot_single_run(name, history):
+    """Mỗi thí nghiệm có learning curves RIÊNG, hiển thị sau log epoch."""
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 3.6))
+    axes[0].plot(history.epoch, history.train_acc * 100, label="Train sạch")
+    axes[0].plot(history.epoch, history.val_acc * 100, label="Validation")
+    axes[1].plot(history.epoch, history.train_loss, label="Train sạch")
+    axes[1].plot(history.epoch, history.val_loss, label="Validation")
+    axes[0].set(xlabel="Epoch", ylabel="Accuracy (%)", title="Accuracy")
+    axes[1].set(xlabel="Epoch", ylabel="Cross-entropy loss", title="Loss")
+    for ax in axes:
+        ax.grid(alpha=.25)
+        ax.legend()
+    fig.suptitle(f"Learning curves: {name}", weight="bold")
+    plt.tight_layout()
+    plt.show()
+
+
+def run_experiment(name, model_factory, use_aug=False, wd=0.0,
+                   epochs=EPOCHS, seed=SEED, show_plot=True):
+    """Tạo mô hình mới, train/eval cùng engine; KHÔNG dùng test set."""
+    if name in HISTORIES:
+        raise ValueError(f"Tên thí nghiệm đã tồn tại: {name}. Run all để làm mới.")
+    seed_all(seed)
+    model = model_factory().to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=wd)
+    dl_train = train_aug_loader if use_aug else train_plain_loader
+    start = time.perf_counter()
+    print(f"\n=== {name} ===")
+    print(f"params={count_params(model):,} | augmentation={use_aug} | "
+          f"weight_decay={wd:g} | lr={LR} | epochs={epochs}")
+    model, history, best_epoch = fit_model(
+        model, dl_train, train_clean_loader, val_loader,
+        optimizer, criterion, DEVICE, epochs, run_name=name)
+    seconds = time.perf_counter() - start
+    train = evaluate(model, train_clean_loader, criterion, DEVICE)
+    val = evaluate(model, val_loader, criterion, DEVICE)
+    row = {"model": name, "parameters": count_params(model),
+           "best_epoch": best_epoch, "train_acc": train["accuracy"],
+           "val_acc": val["accuracy"], "val_loss": val["loss"],
+           "gap": train["accuracy"] - val["accuracy"], "seconds": round(seconds, 2)}
+    HISTORIES[name] = history
+    BEST_MODELS[name] = copy.deepcopy(model).cpu()   # không chiếm GPU giữa các runs
+    RESULTS.append(row)
+    print(f"\nCHECKPOINT được chọn: epoch {best_epoch:02d} | "
+          f"train_acc={train['accuracy']:.2%} | val_acc={val['accuracy']:.2%} | "
+          f"val_loss={val['loss']:.4f} | gap={row['gap']:+.2%}")
+    if show_plot:
+        plot_single_run(name, history)
+
+    # Phân tích lỗi trên VALIDATION tại checkpoint tốt nhất của thí nghiệm.
+    analysis = analyze_validation_errors(
+        model, val_loader, CLASS_NAMES, DEVICE,
+        mean=mu, std=sigma, run_name=name, max_examples=6, show_plot=show_plot)
+    row["val_errors"] = analysis["n_errors"]
+    VAL_ANALYSES[name] = analysis
+    return row
+
+print("Đã khai báo fit_model()/run_experiment(): mỗi thí nghiệm có log, curves và phân tích lỗi validation.")
+
+@torch.inference_mode()
+def collect_validation_predictions(model, dataloader, device):
+    """Thu chi tiết dự đoán trên validation (DataLoader không shuffle/augment).
+
+    Args:
+        model: mô hình trả logits có shape [batch_size, n_classes].
+        dataloader: DataLoader validation, shuffle=False; trả (images, labels).
+        device: CPU hoặc GPU.
+    Returns:
+        details: DataFrame với vị trí mẫu, nhãn thật/dự đoán, confidence,
+                 p_true (xác suất nhãn thật) và cột correct.
+        images: tensor ảnh ĐÃ CHUẨN HÓA ở CPU, cùng thứ tự với details.
+    """
+    model.eval()
+    records, stored_images = [], []
+    sample_index = 0
+
+    for images, labels in dataloader:
+        logits = model(images.to(device))
+        probabilities = torch.softmax(logits, dim=1)
+        confidence, predictions = probabilities.max(dim=1)
+        p_true = probabilities.gather(1, labels.to(device).unsqueeze(1)).squeeze(1)
+
+        labels_cpu = labels.cpu().tolist()
+        preds_cpu = predictions.cpu().tolist()
+        confidences = confidence.cpu().tolist()
+        p_true_values = p_true.cpu().tolist()
+        stored_images.append(images.detach().cpu().clone())
+
+        for true_label, pred_label, score, true_score in zip(
+            labels_cpu, preds_cpu, confidences, p_true_values
+        ):
+            records.append({
+                "sample_index": sample_index,
+                "true_label": int(true_label),
+                "pred_label": int(pred_label),
+                "confidence": float(score),
+                "p_true": float(true_score),
+                "correct": int(true_label) == int(pred_label),
+            })
+            sample_index += 1
+
+    if not records:
+        raise ValueError("DataLoader validation không được rỗng")
+    return pd.DataFrame(records), torch.cat(stored_images, dim=0)
+
+
+def plot_misclassified_images(details, images, class_names, *,
+                              mean=0.0, std=1.0, max_examples=6,
+                              hardest_first=True, title="Validation"):
+    """Vẽ mẫu sai theo confidence; chỉ dùng predictions của validation.
+
+    hardest_first=True: ưu tiên sai nhưng tự tin cao (high-confidence errors).
+    hardest_first=False: ưu tiên sai có confidence thấp (uncertain errors).
+    """
+    wrong = details.loc[~details["correct"]].sort_values(
+        "confidence", ascending=not hardest_first).head(max_examples)
+    if wrong.empty:
+        print("Không có mẫu validation dự đoán sai để hiển thị.")
+        return
+
+    ncols = min(3, len(wrong))
+    nrows = (len(wrong) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.6 * ncols, 3.4 * nrows),
+                             squeeze=False)
+    for ax in axes.ravel():
+        ax.axis("off")
+
+    for ax, sample in zip(axes.ravel(), wrong.itertuples(index=False)):
+        index = int(sample.sample_index)
+        image = (images[index] * std + mean).clamp(0, 1)
+        if image.shape[0] == 1:
+            ax.imshow(image[0], cmap="gray", vmin=0, vmax=1)
+        elif image.shape[0] == 3:
+            ax.imshow(image.permute(1, 2, 0))
+        else:
+            raise ValueError("Ví dụ minh họa hiện hỗ trợ ảnh 1 hoặc 3 kênh")
+        ax.set_title(
+            f"Mẫu #{index} | Thật: {class_names[sample.true_label]} "
+            f"→ Dự đoán: {class_names[sample.pred_label]}\n"
+            f"Confidence: {sample.confidence:.1%} | P(nhãn thật): {sample.p_true:.1%}",
+            fontsize=9, color="firebrick")
+    label = "Sai nhưng rất tự tin" if hardest_first else "Sai với confidence thấp"
+    fig.suptitle(f"{title} — {label} (VALIDATION)", fontsize=12, weight="bold")
+    plt.tight_layout()
+    plt.show()
+
+
+def analyze_validation_errors(model, dataloader, class_names, device, *,
+                              mean=0.0, std=1.0, run_name="Model",
+                              max_examples=6, show_plot=True):
+    """Thống kê và minh họa lỗi validation; không động tới test set."""
+    details, images = collect_validation_predictions(model, dataloader, device)
+    wrong = details.loc[~details["correct"]].copy()
+    n_total, n_errors = len(details), len(wrong)
+    print(f"\n--- PHÂN TÍCH MẪU SAI TRÊN VALIDATION — {run_name} ---")
+    print(f"Sai {n_errors}/{n_total} mẫu ({n_errors/n_total:.2%}); "
+          f"đúng {(n_total-n_errors)/n_total:.2%}.")
+
+    if n_errors:
+        pairs = (wrong.groupby(["true_label", "pred_label"])
+                 .size().sort_values(ascending=False).head(3))
+        print("Các cặp nhầm lẫn phổ biến (lớp thật → lớp dự đoán):")
+        for (true_id, pred_id), count in pairs.items():
+            print(f"  {class_names[true_id]} → {class_names[pred_id]}: {count} mẫu")
+        print(f"Confidence trung bình của các mẫu sai: {wrong['confidence'].mean():.2%}")
+    else:
+        print("Không có cặp nhầm lẫn trong validation tại checkpoint này.")
+
+    if show_plot and n_errors:
+        plot_misclassified_images(
+            details, images, class_names, mean=mean, std=std,
+            max_examples=max_examples, hardest_first=True, title=run_name)
+
+    return {"details": details, "images": images,
+            "n_errors": n_errors, "n_total": n_total}
+
+print("Đã khai báo collect_validation_predictions(), "
+      "plot_misclassified_images() và analyze_validation_errors().")
+
+result_E0 = run_experiment(
+    "E0 LeNet Tanh+Avg", lambda: LeNet(activation="tanh", pool="avg"), use_aug=False, wd=0.0
+)
+
+result_E1 = run_experiment(
+    "E1 LeNet ReLU+Max", lambda: LeNet(activation="relu", pool="max"), use_aug=False, wd=0.0
+)
+
+result_E2 = run_experiment(
+    "E2 LeNet +Dropout+WD", lambda: LeNet(activation="relu", pool="max", dropout=.35), use_aug=False, wd=1e-3
+)
+
+result_E3 = run_experiment(
+    "E3 LeNet +Augmentation", lambda: LeNet(activation="relu", pool="max", dropout=.35), use_aug=True, wd=1e-3
+)
+
+result_E4 = run_experiment(
+    "E4 LeNet +BatchNorm", lambda: LeNet(activation="relu", pool="max", batchnorm=True, dropout=.35), use_aug=True, wd=1e-3
+)
+
+result_M1 = run_experiment(
+    "M1 VGG-tiny", VGGTiny, use_aug=True, wd=1e-3
+)
+
+result_M2 = run_experiment(
+    "M2 Inception-tiny", InceptionTiny, use_aug=True, wd=1e-3
+)
+
+result_M3 = run_experiment(
+    "M3 ResNet-tiny", ResNetTiny, use_aug=True, wd=1e-3
+)
+
+if len(RESULTS) != 8:
+    raise RuntimeError(f"Cần chạy đủ 8 thí nghiệm trước tổng hợp; hiện có {len(RESULTS)}")
+
+summary_df = (pd.DataFrame(RESULTS).sort_values(["val_loss", "val_acc"],
+                                                  ascending=[True, False]).reset_index(drop=True))
+summary_display = summary_df.copy()
+for col in ["train_acc", "val_acc", "gap"]:
+    summary_display[col] = (summary_display[col] * 100).round(2)
+summary_display["val_loss"] = summary_display["val_loss"].round(4)
+print("BẢNG TỔNG HỢP ĐỦ 8 THÍ NGHIỆM (xếp hạng theo validation loss):")
+display(summary_display)
+
+# Dùng lại cho báo cáo sau này, không dùng test set trong bảng này.
+summary_df.to_csv("cnn_experiments_validation_summary.csv", index=False)
+print("Đã lưu bảng validation: cnn_experiments_validation_summary.csv")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
+for name, h in HISTORIES.items():
+    axes[0].plot(h.epoch, h.val_acc * 100, label=name)
+    axes[1].plot(h.epoch, h.val_loss, label=name)
+axes[0].set(title="Validation accuracy — tất cả 8 thí nghiệm", xlabel="Epoch", ylabel="Accuracy (%)")
+axes[1].set(title="Validation loss — tất cả 8 thí nghiệm", xlabel="Epoch", ylabel="Cross-entropy")
+for ax in axes:
+    ax.grid(alpha=.25)
+axes[1].legend(fontsize=8, bbox_to_anchor=(1.02, 1), loc="upper left")
+plt.tight_layout()
+plt.show()
+
+print("\nSO SÁNH CÁC BƯỚC LE-NET (đơn vị: điểm phần trăm trên validation):")
+ordered = pd.DataFrame(RESULTS).set_index("model")
+comparisons = [
+    ("E0 LeNet Tanh+Avg", "E1 LeNet ReLU+Max", "ReLU + MaxPool"),
+    ("E1 LeNet ReLU+Max", "E2 LeNet +Dropout+WD", "Dropout + weight decay"),
+    ("E2 LeNet +Dropout+WD", "E3 LeNet +Augmentation", "thêm augmentation"),
+    ("E3 LeNet +Augmentation", "E4 LeNet +BatchNorm", "thêm BatchNorm"),
+]
+for a, b, label in comparisons:
+    delta = 100 * (ordered.loc[b, "val_acc"] - ordered.loc[a, "val_acc"])
+    print(f"{a[:2]} → {b[:2]} ({label}): {delta:+.2f} pp")
+
+
+# Chỉ chọn mô hình đã đứng đầu ở bảng validation; không truy cập test_loader.
+best_name = summary_df.loc[0, "model"]
+best_val_analysis = VAL_ANALYSES[best_name]
+val_details = best_val_analysis["details"]
+val_images = best_val_analysis["images"]
+
+print("MÔ HÌNH ĐƯỢC CHỌN BẰNG VALIDATION LOSS:", best_name)
+print(f"Tổng mẫu validation: {len(val_details)} | "
+      f"Dự đoán sai: {best_val_analysis['n_errors']} | "
+      f"Tỷ lệ sai: {best_val_analysis['n_errors'] / len(val_details):.2%}")
+
+# Bảng lỗi theo LỚP THẬT (quan trọng khi các lớp không cân bằng).
+per_class = (val_details.groupby("true_label", as_index=False)
+             .agg(n_samples=("correct", "size"),
+                  n_correct=("correct", "sum")))
+per_class["n_errors"] = per_class["n_samples"] - per_class["n_correct"]
+per_class["error_rate_pct"] = (
+    100 * per_class["n_errors"] / per_class["n_samples"])
+per_class["class_name"] = per_class["true_label"].map(
+    lambda idx: CLASS_NAMES[idx])
+per_class = per_class[["class_name", "n_samples", "n_errors", "error_rate_pct"]]
+per_class = per_class.sort_values(
+    ["error_rate_pct", "n_errors"], ascending=False).reset_index(drop=True)
+print("\nBẢNG LỖI THEO LỚP — VALIDATION (không có test):")
+display(per_class.style.format({"error_rate_pct": "{:.2f}%"}))
+
+cm_val = confusion_matrix(
+    val_details["true_label"], val_details["pred_label"],
+    labels=list(range(len(CLASS_NAMES))))
+fig, ax = plt.subplots(figsize=(7.4, 6.1))
+ConfusionMatrixDisplay(cm_val, display_labels=CLASS_NAMES).plot(
+    ax=ax, cmap="Blues", xticks_rotation=45, colorbar=False, values_format="d")
+ax.set_title(f"Confusion matrix — VALIDATION — {best_name}")
+plt.tight_layout()
+plt.show()
+
+
+print("NHÓM A — Các mẫu SAI nhưng confidence CAO:")
+plot_misclassified_images(
+    val_details, val_images, CLASS_NAMES, mean=mu, std=sigma,
+    max_examples=6, hardest_first=True, title=f"{best_name} — Nhóm A")
+
+print("NHÓM B — Các mẫu SAI có confidence THẤP:")
+plot_misclassified_images(
+    val_details, val_images, CLASS_NAMES, mean=mu, std=sigma,
+    max_examples=6, hardest_first=False, title=f"{best_name} — Nhóm B")
+
+
+# CHỈ PHẦN NÀY mới sử dụng test_loader cho đánh giá mô hình.
+best_name = summary_df.loc[0, "model"]
+best_model = BEST_MODELS[best_name].to(DEVICE)
+final_test = test_model(best_model, test_loader, criterion, DEVICE, CLASS_NAMES)
+
+print("MÔ HÌNH CHỌN THEO VALIDATION:", best_name)
+print(f"Validation loss = {summary_df.loc[0, 'val_loss']:.4f} | "
+      f"Validation accuracy = {summary_df.loc[0, 'val_acc']:.2%}")
+print(f"TEST loss = {final_test['loss']:.4f} | "
+      f"TEST accuracy = {final_test['accuracy']:.2%} | "
+      f"n_test = {final_test['n_samples']}")
+print("\nCLASSIFICATION REPORT (chỉ mô hình cuối):")
+print(final_test["classification_report"])
+
+fig, ax = plt.subplots(figsize=(7.5, 6.5))
+ConfusionMatrixDisplay(final_test["confusion_matrix"], display_labels=CLASS_NAMES).plot(
+    ax=ax, cmap="Blues", xticks_rotation=45, colorbar=False, values_format="d")
+ax.set_title(f"Confusion matrix — TEST — {best_name}")
+plt.tight_layout()
+plt.show()
+
+first_conv = next(m for m in best_model.modules() if isinstance(m,nn.Conv2d))
+example_img, example_label = test_loader.dataset[0]
+with torch.no_grad():
+    maps=first_conv(example_img.unsqueeze(0).to(DEVICE)).cpu()[0]
+num_show=min(8,maps.shape[0])
+fig,axs=plt.subplots(1,num_show+1,figsize=(2*(num_show+1),2.3))
+axs[0].imshow(X_test[0].permute(1,2,0)); axs[0].set_title('Ảnh gốc');axs[0].axis('off')
+for j in range(num_show):
+    axs[j+1].imshow(maps[j],cmap='viridis');axs[j+1].set_title(f'Filter {j+1}');axs[j+1].axis('off')
+plt.suptitle(f'Feature maps lớp conv đầu — {best_name}')
+plt.tight_layout();plt.show()
+print('Shape output conv đầu tiên:',tuple(maps.shape))
